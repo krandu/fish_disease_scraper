@@ -14,12 +14,13 @@ Fish Disease Image Dataset Collector
   --diseases      指定要收集的疾病列表 (用逗号分隔)
   --max-per-class 每类最多收集图片数量 (默认: 50)
   --output-dir    输出目录 (默认: fish_disease_dataset)
-  --sources       选择图片源: flickr,inat,gbif,wikimedia (默认: 全部)
+  --sources       选择图片源: inat,gbif,wikimedia,flickr (默认: 全部)
   --no-zip        不打包 ZIP
-  --min-size      最小图片尺寸 px (默认: 200)
+  --min-size      最小图片尺寸 px (默认: 150)
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -34,7 +35,6 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── 尝试导入可选依赖 ────────────────────────────────────────────────────────
 try:
     import requests
     HAS_REQUESTS = True
@@ -48,7 +48,6 @@ try:
 except ImportError:
     HAS_PIL = False
 
-# ── 日志配置 ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -58,86 +57,140 @@ logging.basicConfig(
 log = logging.getLogger("fish-scraper")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 分类过滤白名单 / 黑名单
+# 过滤配置  ── 设计原则：只在【分类学字段】做硬过滤，不碰 URL 路径
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# iNaturalist taxon_id 白名单 — 只允许这些大类（鱼纲）
-# 47178 = Ray-finned Fishes (Actinopterygii)
-# 85497 = Cartilaginous Fishes (Chondrichthyes)
-# 48921 = Jawless Fishes (Agnatha)
+# iNaturalist taxon_id — 鱼类三大纲的根节点
+# 47178 Actinopterygii 辐鳍鱼纲  85497 Chondrichthyes 软骨鱼纲  48921 Petromyzontida 无颌
 INAT_FISH_TAXON_IDS = "47178,85497,48921"
 
-# GBIF classKey 白名单（硬骨鱼纲、软骨鱼纲）
-GBIF_CLASS_KEYS = [
-    "204",    # Actinopterygii 辐鳍鱼纲
-    "133",    # Chondrichthyes 软骨鱼纲
-    "11592",  # Sarcopterygii  肉鳍鱼纲
-]
+# GBIF classKey — 只取鱼纲
+GBIF_CLASS_KEYS = ["204", "133", "11592"]   # Actinopterygii / Chondrichthyes / Sarcopterygii
 
-# 被观测物种名中禁止出现的词（排除鸟、哺乳、昆虫、植物、真菌等）
-NON_FISH_TAXON_KEYWORDS = {
-    # 鸟类
-    "aves", "bird", "passerine", "raptor", "waterfowl",
-    # 哺乳
-    "mammalia", "mammal", "rodent", "primate",
-    # 爬行/两栖
-    "reptilia", "reptile", "amphibia", "amphibian", "serpentes",
-    "snake", "frog", "toad", "lizard", "turtle", "crocodil",
-    # 昆虫/蛛形
-    "insecta", "insect", "arachnida", "spider", "lepidoptera",
-    "coleoptera", "diptera", "hymenoptera",
-    # 软体/甲壳（非鱼水生）
-    "mollusca", "mollusc", "crustacea", "crustacean",
-    # 植物 ← 新增
-    "plantae", "plant", "flora", "botany", "angiosperm",
-    "gymnosperm", "moss", "fern", "grass", "herb", "shrub",
-    "tree", "flower", "leaf", "root", "stem", "petal", "sepal",
-    "pollen", "seed", "fruit", "vegetable", "algae", "seaweed",
-    # 真菌 ← 新增
-    "fungi", "fungus", "mycology", "mushroom", "mold", "mould",
-    "lichen", "yeast", "basidiomycota", "ascomycota",
-    # 宠物/家畜（防止误匹配）
-    "cat", "dog", "horse", "cow", "pig", "sheep", "goat",
-}
+# iNat iconic_taxon_name 白名单（空字符串=未分类，保留）
+INAT_ICONIC_WHITELIST = {"Actinopterygii", "Chondrichthyes", ""}
+
+# 仅在分类学字段（taxon.name / class / order / family）做精确词匹配
+# !! 不要把这些词用于 URL 过滤 —— URL 是纯数字 ID，不含物种词
+TAXON_FIELD_BLACKLIST = frozenset({
+    "aves", "mammalia", "reptilia", "amphibia",
+    "insecta", "arachnida", "myriapoda",
+    "plantae", "fungi", "chromista", "protozoa",
+    "mollusca", "crustacea",
+})
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 鱼病关键词配置
+# 鱼病搜索词  ── 精简为学名/通用名，去掉冗余形容词减少噪声
 # ═══════════════════════════════════════════════════════════════════════════════
 FISH_DISEASES = {
-    "白点病 (Ich)":          ["ichthyophthirius multifiliis", "fish ich white spot"],
-    "烂尾病 (Fin Rot)":      ["fish fin rot bacterial", "pseudomonas fin rot fish"],
-    "水霉病 (Saprolegnia)":  ["saprolegnia fish fungal", "fish saprolegniosis"],
-    "细菌性溃疡":             ["fish bacterial ulcer skin lesion", "fish aeromonas ulcer"],
-    "锚头鳋 (Anchor Worm)": ["lernaea fish parasite", "fish anchor worm lernaeosis"],
-    "鱼虱 (Fish Lice)":     ["argulus fish lice parasite", "fish argulosis"],
-    "竖鳞病 (Dropsy)":      ["fish dropsy ascites swollen", "fish kidney disease edema"],
-    "出血病 (Hemorrhage)":   ["fish hemorrhagic septicemia", "fish erythrodermatitis hemorrhage"],
-    "鳃病 (Gill Disease)":  ["fish gill disease pathology", "fish bacterial gill disease"],
-    "眼病 (Pop-eye)":        ["fish exophthalmia popeye", "fish eye infection exophthalmos"],
-    "肠炎 (Enteritis)":     ["fish enteritis aeromonas intestinal", "fish bacterial enteritis"],
-    "传染性造血器官坏死":      ["infectious hematopoietic necrosis salmon IHN", "IHN virus salmonid"],
-    "病毒性出血性败血症":      ["viral hemorrhagic septicemia VHS fish", "VHS novirhabdovirus fish"],
-    "鲤春病毒血症":           ["spring viremia carp SVC rhabdovirus", "carp SVC hemorrhagic"],
-    "健康鱼对照":             ["healthy koi carp aquarium", "healthy trout salmon aquaculture"],
+    "白点病 (Ich)": [
+        "ichthyophthirius multifiliis fish",
+        "ich white spot fish disease",
+    ],
+    "烂尾病 (Fin Rot)": [
+        "fin rot fish bacterial",
+        "fish finnrot pseudomonas",
+    ],
+    "水霉病 (Saprolegnia)": [
+        "saprolegnia fish infection",
+        "fish water mold saprolegniasis",
+    ],
+    "细菌性溃疡": [
+        "aeromonas fish ulcer",
+        "fish skin ulcer bacterial lesion",
+    ],
+    "锚头鳋 (Anchor Worm)": [
+        "lernaea fish parasite",
+        "anchor worm fish copepod",
+    ],
+    "鱼虱 (Fish Lice)": [
+        "argulus fish lice",
+        "fish louse branchiura parasite",
+    ],
+    "竖鳞病 (Dropsy)": [
+        "fish dropsy pinecone scales",
+        "fish ascites edema scale protrusion",
+    ],
+    "出血病 (Hemorrhage)": [
+        "fish hemorrhagic disease skin",
+        "erythrodermatitis fish hemorrhage lesion",
+    ],
+    "鳃病 (Gill Disease)": [
+        "fish gill disease pathology",
+        "fish bacterial gill infection",
+    ],
+    "眼病 (Pop-eye)": [
+        "fish exophthalmia popeye",
+        "fish eye swelling exophthalmos",
+    ],
+    "肠炎 (Enteritis)": [
+        "fish enteritis intestinal disease",
+        "aeromonas fish gut infection",
+    ],
+    "传染性造血器官坏死 (IHN)": [
+        "infectious hematopoietic necrosis fish",
+        "IHN virus salmonid rhabdovirus",
+    ],
+    "病毒性出血性败血症 (VHS)": [
+        "viral hemorrhagic septicemia fish",
+        "VHS novirhabdovirus salmonid",
+    ],
+    "鲤春病毒血症 (SVC)": [
+        "spring viremia carp rhabdovirus",
+        "SVC carp hemorrhagic disease",
+    ],
+    "健康鱼对照": [
+        "healthy koi carp fish",
+        "healthy trout salmon aquaculture fish",
+    ],
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 第一层过滤：API 请求时锁定鱼类分类 ID
+# 工具函数
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _json_get(url: str, timeout: int = 20) -> dict:
+    headers = {"User-Agent": "FishDiseaseDatasetBot/1.0 (academic research)"}
+    if HAS_REQUESTS:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def _taxon_is_fish(taxon_fields: list[str]) -> bool:
+    """
+    检查若干分类学字段，只要含黑名单词就拒绝。
+    使用精确词边界匹配，避免 'plant' 误杀 'implant' 等。
+    """
+    combined = " ".join(f.lower() for f in taxon_fields if f)
+    for bad in TAXON_FIELD_BLACKLIST:
+        # 用词边界匹配：\bword\b
+        if re.search(r'\b' + re.escape(bad) + r'\b', combined):
+            return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 数据源
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_inat_images(query: str, max_count: int) -> list[dict]:
     """
-    iNaturalist API
-    关键修复: taxon_id 锁定辐鳍鱼 / 软骨鱼 / 无颌鱼，不再依赖模糊的 taxon_name
+    iNaturalist — taxon_id 锁定鱼类三大纲，iconic_taxon_name 白名单二次校验
+    quality_grade=any 放宽（research 太严会导致数量极少）
     """
     results = []
-    page, per_page = 1, min(max_count, 30)
+    page, per_page = 1, min(max_count, 200)
     while len(results) < max_count:
         url = (
             "https://api.inaturalist.org/v1/observations?"
             f"q={urllib.parse.quote(query)}"
-            f"&taxon_id={INAT_FISH_TAXON_IDS}"   # ← 锁定鱼类 taxon ID
-            "&has[]=photos&quality_grade=research"
+            f"&taxon_id={INAT_FISH_TAXON_IDS}"
+            "&has[]=photos"
+            # 放开 quality_grade，不只限 research
             f"&per_page={per_page}&page={page}"
             "&order=desc&order_by=created_at"
         )
@@ -147,16 +200,12 @@ def fetch_inat_images(query: str, max_count: int) -> list[dict]:
             if not items:
                 break
             for obs in items:
-                # 第二层校验：观测记录的 taxon 名称不得含非鱼关键词
                 taxon = obs.get("taxon") or {}
-                taxon_name_lower = (taxon.get("name", "") + " " + taxon.get("iconic_taxon_name", "")).lower()
-                if any(bad in taxon_name_lower for bad in NON_FISH_TAXON_KEYWORDS):
-                    log.debug(f"iNat skip non-fish taxon: {taxon.get('name')}")
-                    continue
-                # iconic_taxon_name 必须是 Actinopterygii / 鱼相关
                 iconic = taxon.get("iconic_taxon_name", "")
-                if iconic and iconic not in ("Actinopterygii", "Chondrichthyes", ""):
-                    log.debug(f"iNat skip iconic={iconic}")
+                if iconic not in INAT_ICONIC_WHITELIST:
+                    continue
+                taxon_name = taxon.get("name", "")
+                if not _taxon_is_fish([taxon_name, iconic]):
                     continue
                 for photo in obs.get("photos", []):
                     img_url = photo.get("url", "").replace("square", "large")
@@ -164,14 +213,15 @@ def fetch_inat_images(query: str, max_count: int) -> list[dict]:
                         results.append({
                             "url": img_url,
                             "source": "iNaturalist",
-                            "obs_id": obs.get("id"),
-                            "taxon": taxon.get("name", ""),
+                            "taxon": taxon_name,
                             "license": photo.get("license_code", "unknown"),
                         })
                         if len(results) >= max_count:
                             return results
+            if len(items) < per_page:
+                break
             page += 1
-            time.sleep(0.5)
+            time.sleep(0.4)
         except Exception as e:
             log.debug(f"iNat error: {e}")
             break
@@ -180,21 +230,21 @@ def fetch_inat_images(query: str, max_count: int) -> list[dict]:
 
 def fetch_gbif_images(query: str, max_count: int) -> list[dict]:
     """
-    GBIF API
-    关键修复: classKey 锁定硬骨鱼纲 / 软骨鱼纲，排除鸟类等
+    GBIF — kingdom=Animalia + classKey 双重锁定
+    对每个 classKey 单独翻页，最大化召回
     """
     results = []
-    # 对每个 classKey 分别请求，合并结果
-    per_class = max(max_count // len(GBIF_CLASS_KEYS) + 5, 10)
+    per_class_target = max(max_count // len(GBIF_CLASS_KEYS) + 10, 20)
     for class_key in GBIF_CLASS_KEYS:
-        offset, limit = 0, min(per_class, 25)
-        while len(results) < max_count:
+        offset, limit = 0, 25
+        class_results = []
+        while len(class_results) < per_class_target:
             url = (
                 "https://api.gbif.org/v1/occurrence/search?"
                 f"q={urllib.parse.quote(query)}"
                 "&mediaType=StillImage"
-                "&kingdom=Animalia"         # ← 排除植物/真菌 kingdom
-                f"&classKey={class_key}"    # ← 锁定鱼纲分类
+                "&kingdom=Animalia"
+                f"&classKey={class_key}"
                 f"&limit={limit}&offset={offset}"
             )
             try:
@@ -203,149 +253,87 @@ def fetch_gbif_images(query: str, max_count: int) -> list[dict]:
                 if not items:
                     break
                 for occ in items:
-                    # 第二层校验：kingdom 必须是 Animalia，class/order 黑名单过滤
-                    occ_kingdom = (occ.get("kingdom", "") or "").lower()
-                    if occ_kingdom and occ_kingdom != "animalia":
-                        log.debug(f"GBIF skip kingdom={occ_kingdom}")
+                    kingdom = (occ.get("kingdom") or "").lower()
+                    if kingdom and kingdom != "animalia":
                         continue
-                    occ_class = (occ.get("class", "") or "").lower()
-                    occ_order = (occ.get("order", "") or "").lower()
-                    occ_family = (occ.get("family", "") or "").lower()
-                    if any(bad in occ_class for bad in NON_FISH_TAXON_KEYWORDS):
-                        continue
-                    if any(bad in occ_order for bad in NON_FISH_TAXON_KEYWORDS):
-                        continue
-                    if any(bad in occ_family for bad in NON_FISH_TAXON_KEYWORDS):
+                    taxon_fields = [
+                        occ.get("class", ""),
+                        occ.get("order", ""),
+                        occ.get("family", ""),
+                    ]
+                    if not _taxon_is_fish(taxon_fields):
                         continue
                     for media in occ.get("media", []):
                         img_url = media.get("identifier", "")
                         if img_url and img_url.startswith("http"):
-                            results.append({
+                            class_results.append({
                                 "url": img_url,
                                 "source": "GBIF",
-                                "key": occ.get("key"),
-                                "taxon": occ.get("species", occ.get("genus", "")),
+                                "taxon": occ.get("species") or occ.get("genus", ""),
                                 "license": media.get("license", "unknown"),
                             })
-                            if len(results) >= max_count:
-                                return results
-                offset += limit
-                time.sleep(0.4)
-            except Exception as e:
-                log.debug(f"GBIF error (classKey={class_key}): {e}")
-                break
-    return results
-
-
-def fetch_flickr_images(query: str, max_count: int, api_key: str = "") -> list[dict]:
-    """
-    Flickr
-    关键修复: 搜索词强制加 'fish' 前缀，避免纯疾病词匹配到其他动物
-    """
-    api_key = api_key or os.environ.get("FLICKR_API_KEY", "")
-    # 确保查询词包含 fish
-    if "fish" not in query.lower() and "salmon" not in query.lower() \
-            and "carp" not in query.lower() and "trout" not in query.lower():
-        query = "fish " + query
-    results = []
-    if api_key:
-        page, per_page = 1, min(max_count, 50)
-        while len(results) < max_count:
-            url = (
-                "https://www.flickr.com/services/rest/?"
-                "method=flickr.photos.search"
-                f"&api_key={api_key}"
-                f"&text={urllib.parse.quote(query)}"
-                "&license=1,2,3,4,5,6,9,10"
-                "&content_type=1&media=photos"
-                f"&per_page={per_page}&page={page}"
-                "&extras=url_l,url_m,license,tags"
-                "&format=json&nojsoncallback=1"
-            )
-            try:
-                data = _json_get(url)
-                photos = data.get("photos", {}).get("photo", [])
-                if not photos:
+                if len(items) < limit:
                     break
-                for p in photos:
-                    # 第二层：标签中含非鱼关键词则跳过
-                    tags = (p.get("tags", "") or "").lower()
-                    if any(bad in tags for bad in NON_FISH_TAXON_KEYWORDS):
-                        continue
-                    img_url = p.get("url_l") or p.get("url_m", "")
-                    if img_url:
-                        results.append({
-                            "url": img_url,
-                            "source": "Flickr",
-                            "photo_id": p.get("id"),
-                            "license": p.get("license", "unknown"),
-                        })
-                        if len(results) >= max_count:
-                            return results
-                page += 1
-                time.sleep(0.5)
+                offset += limit
+                time.sleep(0.3)
             except Exception as e:
-                log.debug(f"Flickr API error: {e}")
+                log.debug(f"GBIF error classKey={class_key}: {e}")
                 break
-    else:
-        tag = urllib.parse.quote(query.replace(" ", ","))
-        url = f"https://www.flickr.com/services/feeds/photos_public.gne?tags={tag}&format=json&nojsoncallback=1"
-        try:
-            data = _json_get(url)
-            for item in data.get("items", [])[:max_count]:
-                img = item.get("media", {}).get("m", "")
-                if img:
-                    results.append({
-                        "url": img.replace("_m.", "_b."),
-                        "source": "Flickr-RSS",
-                        "license": "CC",
-                    })
-        except Exception as e:
-            log.debug(f"Flickr RSS error: {e}")
+        results.extend(class_results)
+        if len(results) >= max_count:
+            break
     return results
 
 
 def fetch_wikimedia_images(query: str, max_count: int) -> list[dict]:
     """
-    Wikimedia Commons
-    关键修复: 搜索词加 'fish' 限定 + 分类名黑名单过滤
+    Wikimedia Commons — 搜索词加 fish 限定，分类标题做精确词过滤
+    gsrlimit 提升到 50 增加召回
     """
-    if "fish" not in query.lower() and "salmon" not in query.lower() \
-            and "carp" not in query.lower() and "trout" not in query.lower():
+    fish_anchors = ("fish", "salmon", "carp", "trout", "tilapia",
+                    "catfish", "bass", "tuna", "cod", "herring",
+                    "ichthyo", "piscis", "lernaea", "argulus")
+    if not any(a in query.lower() for a in fish_anchors):
         query = "fish " + query
+
     results = []
     url = (
         "https://commons.wikimedia.org/w/api.php?"
         "action=query&generator=search&prop=imageinfo|categories"
         f"&gsrsearch={urllib.parse.quote(query)}"
-        f"&gsrnamespace=6&gsrlimit={min(max_count, 20)}"
-        "&iiprop=url|extmetadata&iiurlwidth=800"
-        "&cllimit=5"
+        "&gsrnamespace=6"
+        "&gsrlimit=50"
+        "&iiprop=url|extmetadata&iiurlwidth=1000"
+        "&cllimit=10"
         "&format=json"
     )
     try:
         data = _json_get(url)
         pages = data.get("query", {}).get("pages", {})
         for page in pages.values():
-            # 第二层：分类名不得含非鱼关键词
-            cats = [c.get("title", "").lower() for c in page.get("categories", [])]
-            if any(bad in cat for cat in cats for bad in NON_FISH_TAXON_KEYWORDS):
-                log.debug(f"Wikimedia skip non-fish categories: {cats[:3]}")
+            # 页面标题过滤（精确词边界）
+            title = page.get("title", "").lower()
+            if not _taxon_is_fish([title]):
+                log.debug(f"Wikimedia skip title: {page.get('title')}")
                 continue
-            # 额外：标题/描述不得是植物标本
-            page_title = page.get("title", "").lower()
-            if any(bad in page_title for bad in ("plantae", "plant", "flower", "fungi", "mushroom", "algae", "seaweed")):
-                log.debug(f"Wikimedia skip non-fish title: {page.get('title')}")
+            # 分类标题过滤
+            cats = [c.get("title", "").lower() for c in page.get("categories", [])]
+            skip = False
+            for cat in cats:
+                if not _taxon_is_fish([cat]):
+                    skip = True
+                    break
+            if skip:
                 continue
             info = page.get("imageinfo", [{}])[0]
             img_url = info.get("thumburl") or info.get("url", "")
-            if img_url and img_url.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp")):
-                license_info = info.get("extmetadata", {}).get("License", {}).get("value", "unknown")
+            if img_url and re.search(r'\.(jpe?g|png|webp)(\?|$)', img_url, re.I):
+                license_val = info.get("extmetadata", {}).get("License", {}).get("value", "unknown")
                 results.append({
                     "url": img_url,
                     "source": "Wikimedia",
-                    "page_id": page.get("pageid"),
-                    "license": license_info,
+                    "taxon": "",
+                    "license": license_val,
                 })
                 if len(results) >= max_count:
                     break
@@ -354,77 +342,101 @@ def fetch_wikimedia_images(query: str, max_count: int) -> list[dict]:
     return results
 
 
+def fetch_flickr_images(query: str, max_count: int) -> list[dict]:
+    """
+    Flickr — 需要 API Key (环境变量 FLICKR_API_KEY)
+    无 Key 时跳过（避免爬公开 RSS 质量差）
+    """
+    api_key = os.environ.get("FLICKR_API_KEY", "")
+    if not api_key:
+        return []
+
+    fish_anchors = ("fish", "salmon", "carp", "trout", "koi", "tilapia")
+    if not any(a in query.lower() for a in fish_anchors):
+        query = "fish " + query
+
+    results = []
+    page, per_page = 1, min(max_count, 100)
+    while len(results) < max_count:
+        url = (
+            "https://www.flickr.com/services/rest/?"
+            "method=flickr.photos.search"
+            f"&api_key={api_key}"
+            f"&text={urllib.parse.quote(query)}"
+            "&license=1,2,3,4,5,6,9,10"
+            "&content_type=1&media=photos"
+            f"&per_page={per_page}&page={page}"
+            "&extras=url_l,url_m,license,tags,description"
+            "&format=json&nojsoncallback=1"
+        )
+        try:
+            data = _json_get(url)
+            photos = data.get("photos", {}).get("photo", [])
+            if not photos:
+                break
+            for p in photos:
+                tags = (p.get("tags") or "").lower()
+                desc = (p.get("description", {}).get("_content") or "").lower()
+                # 只过滤标签/描述字段，不过滤 URL
+                if not _taxon_is_fish([tags, desc]):
+                    continue
+                img_url = p.get("url_l") or p.get("url_m", "")
+                if img_url:
+                    results.append({
+                        "url": img_url,
+                        "source": "Flickr",
+                        "taxon": "",
+                        "license": str(p.get("license", "unknown")),
+                    })
+                    if len(results) >= max_count:
+                        return results
+            if len(photos) < per_page:
+                break
+            page += 1
+            time.sleep(0.5)
+        except Exception as e:
+            log.debug(f"Flickr error: {e}")
+            break
+    return results
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# 第三层过滤：下载后用 PIL EXIF + 文件名关键词二次剔除
+# 下载
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# URL / 文件名中出现这些词则直接跳过下载（路径前缀匹配）
-URL_BLACKLIST_KEYWORDS = {
-    # 动物非鱼
-    "bird", "aves", "mammal", "reptil", "amphibi", "insect",
-    "spider", "snake", "frog", "cat", "dog", "horse", "cow",
-    # 植物 ← 新增
-    "flower", "plant", "plantae", "flora", "botanical",
-    "tree", "grass", "herb", "shrub", "moss", "fern",
-    "seaweed", "algae", "pollen", "vegetabl",
-    # 真菌 ← 新增
-    "fungi", "fungus", "mushroom", "mold", "lichen",
-    "mycolog", "basidiomyc", "ascomyc",
-}
-
-def url_looks_like_fish(url: str) -> bool:
-    """简单检查 URL / 文件名是否含非鱼黑名单词"""
-    url_lower = url.lower()
-    for bad in URL_BLACKLIST_KEYWORDS:
-        if bad in url_lower:
-            return False
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 核心工具函数
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _json_get(url: str, timeout: int = 15) -> dict:
-    headers = {"User-Agent": "FishDiseaseDatasetBot/1.0 (research; contact@example.com)"}
-    if HAS_REQUESTS:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    else:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-
-
-def download_image(url: str, dest_path: Path, min_size: int = 200) -> bool:
-    """下载单张图片，含尺寸过滤"""
-    # 第三层 URL 过滤
-    if not url_looks_like_fish(url):
-        log.debug(f"URL blacklist skip: {url[:60]}")
-        return False
-
+def download_image(url: str, dest_path: Path, min_size: int = 150) -> bool:
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; FishDiseaseBot/1.0)",
-        "Accept": "image/*,*/*",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
     }
     try:
         if HAS_REQUESTS:
-            resp = requests.get(url, headers=headers, timeout=20, stream=True)
+            resp = requests.get(url, headers=headers, timeout=25, stream=True,
+                                allow_redirects=True)
+            if resp.status_code in (403, 404, 410):
+                return False
             resp.raise_for_status()
             content = resp.content
             content_type = resp.headers.get("Content-Type", "")
         else:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with urllib.request.urlopen(req, timeout=25) as r:
                 content = r.read()
                 content_type = r.headers.get("Content-Type", "")
 
-        if not any(t in content_type for t in ["image/jpeg", "image/png", "image/webp", "image/"]):
-            if not url.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
-                return False
+        # 必须是图片
+        is_image = (
+            "image/" in content_type
+            or re.search(r'\.(jpe?g|png|webp|gif)(\?|$)', url, re.I)
+        )
+        if not is_image:
+            return False
 
-        if HAS_PIL and min_size > 0:
+        # 尺寸过滤
+        if HAS_PIL and min_size > 0 and len(content) > 100:
             try:
                 img = Image.open(_io.BytesIO(content))
                 w, h = img.size
@@ -432,9 +444,9 @@ def download_image(url: str, dest_path: Path, min_size: int = 200) -> bool:
                     return False
                 if img.mode not in ("RGB", "L"):
                     img = img.convert("RGB")
-                out = _io.BytesIO()
-                img.save(out, format="JPEG", quality=90)
-                content = out.getvalue()
+                buf = _io.BytesIO()
+                img.save(buf, format="JPEG", quality=88)
+                content = buf.getvalue()
                 dest_path = dest_path.with_suffix(".jpg")
             except Exception:
                 pass
@@ -444,28 +456,12 @@ def download_image(url: str, dest_path: Path, min_size: int = 200) -> bool:
         return True
 
     except Exception as e:
-        log.debug(f"Download failed [{url[:60]}]: {e}")
+        log.debug(f"Download failed [{url[:70]}]: {e}")
         return False
 
 
-def safe_filename(name: str, idx: int, ext: str = ".jpg") -> str:
-    h = hashlib.md5(name.encode()).hexdigest()[:6]
-    return f"{idx:04d}_{h}{ext}"
-
-
-def create_zip(dataset_dir: Path, output_path: Path) -> Path:
-    log.info(f"📦 正在打包 ZIP: {output_path.name} ...")
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for f in sorted(dataset_dir.rglob("*")):
-            if f.is_file():
-                zf.write(f, f.relative_to(dataset_dir.parent))
-    size_mb = output_path.stat().st_size / 1024 / 1024
-    log.info(f"✅ ZIP 打包完成: {output_path} ({size_mb:.1f} MB)")
-    return output_path
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# 主流程
+# 主收集流程
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def collect_disease(
@@ -476,48 +472,62 @@ def collect_disease(
     sources: list[str],
     min_size: int,
 ) -> dict:
-    safe_name = disease_name.replace("/", "_").replace(" ", "_").replace("(", "").replace(")", "")
+    safe_name = re.sub(r'[^\w\-]', '_', disease_name)
     class_dir = out_dir / safe_name
     class_dir.mkdir(parents=True, exist_ok=True)
 
     log.info(f"🔍 [{disease_name}] 开始搜索 (目标: {max_count} 张)")
+
+    # 每个关键词、每个来源都搜，候选尽量多
+    per_kw_src = max(max_count // max(len(keywords) * max(len(sources), 1), 1) + 20, 30)
     candidates = []
-
     for kw in keywords:
-        per_src = max(max_count // max(len(sources), 1) + 5, 10)
         if "inat" in sources:
-            candidates.extend(fetch_inat_images(kw, per_src))
+            r = fetch_inat_images(kw, per_kw_src)
+            log.debug(f"  iNat [{kw}]: {len(r)}")
+            candidates.extend(r)
         if "gbif" in sources:
-            candidates.extend(fetch_gbif_images(kw, per_src))
-        if "flickr" in sources:
-            candidates.extend(fetch_flickr_images(kw, per_src))
+            r = fetch_gbif_images(kw, per_kw_src)
+            log.debug(f"  GBIF [{kw}]: {len(r)}")
+            candidates.extend(r)
         if "wikimedia" in sources:
-            candidates.extend(fetch_wikimedia_images(kw, per_src))
+            r = fetch_wikimedia_images(kw, per_kw_src)
+            log.debug(f"  Wiki [{kw}]: {len(r)}")
+            candidates.extend(r)
+        if "flickr" in sources:
+            r = fetch_flickr_images(kw, per_kw_src)
+            log.debug(f"  Flickr [{kw}]: {len(r)}")
+            candidates.extend(r)
 
-    # 去重
-    seen_urls = set()
-    unique = []
+    # URL 去重
+    seen, unique = set(), []
     for c in candidates:
-        if c["url"] not in seen_urls:
-            seen_urls.add(c["url"])
+        if c["url"] not in seen:
+            seen.add(c["url"])
             unique.append(c)
 
-    log.info(f"  → 找到 {len(unique)} 个候选 URL，开始下载...")
+    log.info(f"  → 候选 {len(unique)} 个，开始并发下载...")
 
     downloaded = 0
     metadata = []
 
-    def _dl(item, idx):
-        ext = ".jpg"
-        fname = safe_filename(item["url"], idx, ext)
-        dest = class_dir / fname
+    def _dl(item: dict, idx: int):
+        h = hashlib.md5(item["url"].encode()).hexdigest()[:8]
+        dest = class_dir / f"{idx:04d}_{h}.jpg"
         if dest.exists():
-            return item, fname, True
+            return item, dest.name, True
         ok = download_image(item["url"], dest, min_size)
         return item, dest.name, ok
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(_dl, item, i): item for i, item in enumerate(unique[:max_count * 2])}
+    # 候选不够时发出警告
+    if len(unique) < max_count:
+        log.warning(f"  ⚠️  候选仅 {len(unique)} 个，可能不足 {max_count} 张目标")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(_dl, item, i): item
+            for i, item in enumerate(unique[: max_count * 3])  # 多取候选，以防下载失败
+        }
         for fut in as_completed(futures):
             if downloaded >= max_count:
                 break
@@ -531,125 +541,106 @@ def collect_disease(
                     "taxon": item.get("taxon", ""),
                     "license": item.get("license", "unknown"),
                 })
-                if downloaded % 10 == 0:
-                    log.info(f"  ✓ [{disease_name}] 已下载 {downloaded}/{max_count}")
+                if downloaded % 20 == 0:
+                    log.info(f"  ✓ [{disease_name}] {downloaded}/{max_count}")
 
-    meta_path = class_dir / "_metadata.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump({"disease": disease_name, "count": downloaded, "images": metadata}, f, ensure_ascii=False, indent=2)
-
+    (class_dir / "_metadata.json").write_text(
+        json.dumps({"disease": disease_name, "count": downloaded, "images": metadata},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     log.info(f"  ✅ [{disease_name}] 完成: {downloaded} 张")
-    return {"disease": disease_name, "count": downloaded, "dir": str(class_dir)}
+    return {"disease": disease_name, "count": downloaded}
 
 
 def build_dataset_index(dataset_dir: Path, results: list[dict]):
+    total = sum(r["count"] for r in results)
     index = {
         "created_at": datetime.now().isoformat(),
-        "tool": "fish_disease_scraper",
-        "total_images": sum(r["count"] for r in results),
+        "tool": "fish_disease_scraper_v3",
+        "total_images": total,
         "classes": len(results),
         "class_distribution": {r["disease"]: r["count"] for r in results},
-        "filter_layers": [
-            "Layer 1 - API: iNat taxon_id 锁定鱼类, GBIF classKey 锁定鱼纲",
-            "Layer 2 - Metadata: 观测记录 taxon/class/tags 非鱼关键词黑名单",
-            "Layer 3 - URL: 下载前检查 URL 路径非鱼关键词",
-        ],
-        "usage_note": "本数据集仅供学术研究和 AI 模型训练使用。",
+        "filter_strategy": {
+            "inat": "taxon_id 白名单 + iconic_taxon_name 白名单",
+            "gbif": "kingdom=Animalia + classKey 白名单 + 分类字段词边界黑名单",
+            "wikimedia": "搜索词 fish 锚定 + 页面标题/分类词边界黑名单",
+            "flickr": "搜索词 fish 锚定 + 标签/描述词边界黑名单",
+            "url_filter": "不过滤 URL 路径（URL 多为数字 ID，过滤会误杀）",
+        },
     }
-    index_path = dataset_dir / "dataset_index.json"
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
-
+    (dataset_dir / "dataset_index.json").write_text(
+        json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     readme = f"""# 🐟 Fish Disease Image Dataset
 
-> 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}  
-> 总图片数: **{index['total_images']}** | 疾病类别: **{index['classes']}**
-
-## 过滤机制（三层防护）
-
-| 层 | 方式 | 说明 |
-|----|------|------|
-| API 层 | taxon_id / classKey | iNat 锁定辐鳍鱼 ID，GBIF 锁定硬骨/软骨鱼纲 |
-| 元数据层 | 黑名单关键词 | 过滤观测记录中含鸟、哺乳、昆虫等词的条目 |
-| URL 层 | 路径关键词 | 下载前检查 URL 是否含非鱼物种词 |
+生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')} | 总图片: **{total}** | 类别: **{len(results)}**
 
 ## 类别分布
 
 | 疾病 | 图片数 |
 |------|--------|
 """
-    for d, c in index["class_distribution"].items():
-        readme += f"| {d} | {c} |\n"
-
-    readme += "\n## 使用许可\n\n仅供**学术研究和 AI 模型训练**使用，请遵守各来源平台许可协议。\n"
+    for r in results:
+        readme += f"| {r['disease']} | {r['count']} |\n"
+    readme += "\n## 过滤策略\n\n- **API 层**：iNat `taxon_id` / GBIF `classKey` 白名单，从源头锁定鱼类\n"
+    readme += "- **元数据层**：分类字段词边界黑名单（精确匹配，不误杀 URL 数字 ID）\n"
+    readme += "- **不过滤 URL 路径**：图片 URL 多为纯数字，路径过滤只会误杀正确图片\n"
     (dataset_dir / "README.md").write_text(readme, encoding="utf-8")
-    log.info(f"📄 数据集索引已生成: {index_path}")
+    log.info(f"📄 数据集索引已生成")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CLI 入口
+# CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="🐟 鱼病图片数据集自动收集工具")
-    parser.add_argument("--diseases", help="指定疾病(中文名)，逗号分隔；不填则收集全部")
-    parser.add_argument("--max-per-class", type=int, default=50)
-    parser.add_argument("--output-dir", default="fish_disease_dataset")
-    parser.add_argument("--sources", default="inat,gbif,flickr,wikimedia")
-    parser.add_argument("--no-zip", action="store_true")
-    parser.add_argument("--min-size", type=int, default=200)
-    parser.add_argument("--flickr-key", default="")
-    return parser.parse_args()
-
-
-def check_dependencies():
-    if not HAS_REQUESTS:
-        log.error("缺少依赖 requests，请运行: pip install requests")
-        sys.exit(1)
-    if not HAS_PIL:
-        log.warning("⚠️  未安装 Pillow，图片尺寸过滤已禁用 (pip install Pillow)")
+    p = argparse.ArgumentParser(description="🐟 鱼病图片数据集自动收集工具 v3")
+    p.add_argument("--diseases", help="指定疾病中文名，逗号分隔；不填=全部")
+    p.add_argument("--max-per-class", type=int, default=50)
+    p.add_argument("--output-dir", default="fish_disease_dataset")
+    p.add_argument("--sources", default="inat,gbif,wikimedia,flickr")
+    p.add_argument("--no-zip", action="store_true")
+    p.add_argument("--min-size", type=int, default=150)
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
-    check_dependencies()
+    if not HAS_REQUESTS:
+        log.error("缺少 requests，请: pip install requests")
+        sys.exit(1)
+    if not HAS_PIL:
+        log.warning("⚠️  未安装 Pillow，图片尺寸过滤禁用 (pip install Pillow)")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     sources = [s.strip().lower() for s in args.sources.split(",")]
 
+    diseases = FISH_DISEASES
     if args.diseases:
-        selected_names = [d.strip() for d in args.diseases.split(",")]
-        diseases = {k: v for k, v in FISH_DISEASES.items() if any(n in k for n in selected_names)}
+        sel = [d.strip() for d in args.diseases.split(",")]
+        diseases = {k: v for k, v in FISH_DISEASES.items() if any(s in k for s in sel)}
         if not diseases:
             log.error("未匹配到任何疾病，请检查名称")
             sys.exit(1)
-    else:
-        diseases = FISH_DISEASES
 
     log.info("=" * 60)
-    log.info("🐟 鱼病图片数据集收集工具（三层过滤版）")
-    log.info(f"   过滤层: API taxon_id | 元数据黑名单 | URL关键词")
+    log.info("🐟 鱼病图片数据集收集工具 v3")
+    log.info(f"   过滤策略: 分类字段词边界黑名单（不过滤 URL）")
     log.info(f"   疾病类别: {len(diseases)} 类  每类上限: {args.max_per_class} 张")
     log.info(f"   图片来源: {sources}")
     log.info(f"   输出目录: {out_dir.resolve()}")
     log.info("=" * 60)
 
     results = []
-    for disease_name, keywords in diseases.items():
-        result = collect_disease(
-            disease_name=disease_name,
-            keywords=keywords,
-            out_dir=out_dir,
-            max_count=args.max_per_class,
-            sources=sources,
-            min_size=args.min_size if HAS_PIL else 0,
-        )
-        results.append(result)
+    for name, kws in diseases.items():
+        r = collect_disease(name, kws, out_dir, args.max_per_class, sources,
+                            args.min_size if HAS_PIL else 0)
+        results.append(r)
         time.sleep(1)
 
     build_dataset_index(out_dir, results)
-
     total = sum(r["count"] for r in results)
     log.info(f"\n{'='*60}")
     log.info(f"🎉 完成! 共 {total} 张，{len(results)} 个类别")
@@ -658,7 +649,12 @@ def main():
     if not args.no_zip:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         zip_path = Path(f"fish_disease_dataset_{ts}.zip")
-        create_zip(out_dir, zip_path)
+        log.info(f"📦 打包 ZIP: {zip_path}")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for f in sorted(out_dir.rglob("*")):
+                if f.is_file():
+                    zf.write(f, f.relative_to(out_dir.parent))
+        log.info(f"✅ ZIP: {zip_path} ({zip_path.stat().st_size/1024/1024:.1f} MB)")
         print(f"\n📦 ZIP 已生成: {zip_path.resolve()}")
     else:
         print(f"\n📁 数据集目录: {out_dir.resolve()}")
