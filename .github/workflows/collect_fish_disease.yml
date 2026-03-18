@@ -17,7 +17,6 @@ on:
         default: 'inat,gbif,wikimedia'
 
   schedule:
-    # 每周日 UTC 02:00 自动运行（可选）
     - cron: '0 2 * * 0'
 
 jobs:
@@ -45,6 +44,7 @@ jobs:
           python fish_disease_scraper.py \
             --max-per-class ${{ github.event.inputs.max_per_class || '50' }} \
             --sources "${{ github.event.inputs.sources || 'inat,gbif,wikimedia' }}" \
+            --no-zip \
             ${{ github.event.inputs.diseases != '' && format('--diseases "{0}"', github.event.inputs.diseases) || '' }}
 
       - name: List dataset summary
@@ -53,20 +53,21 @@ jobs:
           cat fish_disease_dataset/dataset_index.json || true
           echo ""
           echo "=== File counts per class ==="
-          find fish_disease_dataset -name "*.jpg" -o -name "*.png" -o -name "*.jpeg" | \
-            awk -F/ '{print $2}' | sort | uniq -c | sort -rn || true
+          find fish_disease_dataset -name "*.jpg" -o -name "*.png" -o -name "*.jpeg" \
+            | awk -F/ '{print $2}' | sort | uniq -c | sort -rn || true
 
-      - name: Upload dataset as artifact
+      # 由 Actions 统一打包，不让脚本再生成一份，避免 1.18GB x2
+      - name: Package dataset into ZIP
+        run: |
+          ZIP_NAME="fish_disease_dataset_$(date +%Y%m%d_%H%M).zip"
+          zip -r "$ZIP_NAME" fish_disease_dataset/
+          echo "ZIP_FILE=$ZIP_NAME" >> $GITHUB_ENV
+          echo "ZIP size: $(du -sh $ZIP_NAME | cut -f1)"
+
+      # 只上传一个 artifact
+      - name: Upload dataset ZIP
         uses: actions/upload-artifact@v4
         with:
           name: fish-disease-dataset-${{ github.run_number }}
-          path: |
-            fish_disease_dataset/
-          retention-days: 30
-
-      - name: Upload ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: fish-disease-dataset-zip-${{ github.run_number }}
-          path: fish_disease_dataset_*.zip
+          path: ${{ env.ZIP_FILE }}
           retention-days: 30
