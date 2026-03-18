@@ -1,1 +1,72 @@
+name: 🐟 Fish Disease Dataset Collector
 
+on:
+  workflow_dispatch:
+    inputs:
+      max_per_class:
+        description: '每类最多图片数'
+        required: false
+        default: '50'
+      diseases:
+        description: '指定疾病 (中文名, 逗号分隔; 留空=全部)'
+        required: false
+        default: ''
+      sources:
+        description: '图片来源 (inat,gbif,flickr,wikimedia)'
+        required: false
+        default: 'inat,gbif,wikimedia'
+
+  schedule:
+    # 每周日 UTC 02:00 自动运行（可选）
+    - cron: '0 2 * * 0'
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run collector
+        env:
+          FLICKR_API_KEY: ${{ secrets.FLICKR_API_KEY }}
+        run: |
+          python fish_disease_scraper.py \
+            --max-per-class ${{ github.event.inputs.max_per_class || '50' }} \
+            --sources "${{ github.event.inputs.sources || 'inat,gbif,wikimedia' }}" \
+            ${{ github.event.inputs.diseases != '' && format('--diseases "{0}"', github.event.inputs.diseases) || '' }}
+
+      - name: List dataset summary
+        run: |
+          echo "=== Dataset Summary ==="
+          cat fish_disease_dataset/dataset_index.json || true
+          echo ""
+          echo "=== File counts per class ==="
+          find fish_disease_dataset -name "*.jpg" -o -name "*.png" -o -name "*.jpeg" | \
+            awk -F/ '{print $2}' | sort | uniq -c | sort -rn || true
+
+      - name: Upload dataset as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-disease-dataset-${{ github.run_number }}
+          path: |
+            fish_disease_dataset/
+          retention-days: 30
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-disease-dataset-zip-${{ github.run_number }}
+          path: fish_disease_dataset_*.zip
+          retention-days: 30
